@@ -328,17 +328,6 @@ func isSystemPackage(pkgpath string) bool {
 	return false
 }
 
-func peekNextSplitString(ss string) (s string, spacePos int) {
-	spacePos = strings.IndexFunc(ss, unicode.IsSpace)
-	if spacePos < 0 {
-		s = ss
-		spacePos = len(ss)
-	} else {
-		s = strings.TrimSpace(ss[:spacePos])
-	}
-	return
-}
-
 // parse the func comments
 func parserComments(comments *ast.CommentGroup, funcName, controllerName, pkgpath string) error {
 	var routerPath string
@@ -371,48 +360,73 @@ func parserComments(comments *ast.CommentGroup, funcName, controllerName, pkgpat
 			} else if strings.HasPrefix(t, "@Success") {
 				ss := strings.TrimSpace(t[len("@Success"):])
 				rs := swagger.Response{}
-				respCode, pos := peekNextSplitString(ss)
-				ss = strings.TrimSpace(ss[pos:])
-				respType, pos := peekNextSplitString(ss)
-				if respType == "{object}" || respType == "{array}" {
-					isArray := respType == "{array}"
-					ss = strings.TrimSpace(ss[pos:])
-					schemaName, pos := peekNextSplitString(ss)
-					if schemaName == "" {
-						ColorLog("[ERRO][%s.%s] Schema must follow {object} or {array}\n", controllerName, funcName)
-						os.Exit(-1)
-					}
-					if strings.HasPrefix(schemaName, "[]") {
-						schemaName = schemaName[2:]
-						isArray = true
-					}
-					schema := swagger.Schema{}
-					if sType, ok := basicTypes[schemaName]; ok {
-						typeFormat := strings.Split(sType, ":")
-						schema.Type = typeFormat[0]
-						schema.Format = typeFormat[1]
+				st := make([]string, 3)
+				j := 0
+				var tmp []rune
+				start := false
+
+				for i, c := range ss {
+					if unicode.IsSpace(c) {
+						if !start && j < 2 {
+							continue
+						}
+						if j == 0 || j == 1 {
+							st[j] = string(tmp)
+							tmp = make([]rune, 0)
+							j++
+							start = false
+							if j == 1 {
+								continue
+							} else {
+								st[j] = strings.TrimSpace(ss[i+1:])
+								break
+
+							}
+						}
 					} else {
-						cmpath, m, mod, realTypes := getModel(schemaName)
-						schema.Ref = "#/definitions/" + m
+						start = true
+						tmp = append(tmp, c)
+					}
+				}
+				if len(tmp) > 0 && st[2] == "" {
+					st[2] = strings.TrimSpace(string(tmp))
+				}
+				rs.Description = st[2]
+				if st[1] == "{object}" {
+					if st[2] == "" {
+						panic(controllerName + " " + funcName + " has no object")
+					}
+					cmpath, m, mod, realTypes := getModel(st[2])
+					//ll := strings.Split(st[2], ".")
+					//opts.Type = ll[len(ll)-1]
+					rs.Schema = &swagger.Schema{
+						Ref: "#/definitions/" + m,
+					}
+					if _, ok := modelsList[pkgpath+controllerName]; !ok {
+						modelsList[pkgpath+controllerName] = make(map[string]swagger.Schema, 0)
+					}
+					modelsList[pkgpath+controllerName][st[2]] = mod
+					appendModels(cmpath, pkgpath, controllerName, realTypes)
+				} else if st[1] == "{array}" {
+					rs.Schema = &swagger.Schema{}
+					rs.Schema.Type = "array"
+					if sType, ok := basicTypes[st[2]]; ok {
+						typeFormat := strings.Split(sType, ":")
+						rs.Schema.Type = typeFormat[0]
+						rs.Schema.Format = typeFormat[1]
+					} else {
+						cmpath, m, mod, realTypes := getModel(st[2])
+						rs.Schema.Items = &swagger.Propertie{
+							Ref: "#/definitions/" + m,
+						}
 						if _, ok := modelsList[pkgpath+controllerName]; !ok {
 							modelsList[pkgpath+controllerName] = make(map[string]swagger.Schema, 0)
 						}
-						modelsList[pkgpath+controllerName][schemaName] = mod
+						modelsList[pkgpath+controllerName][st[2]] = mod
 						appendModels(cmpath, pkgpath, controllerName, realTypes)
 					}
-					if isArray {
-						rs.Schema = &swagger.Schema{
-							Type:  "array",
-							Items: &schema,
-						}
-					} else {
-						rs.Schema = &schema
-					}
-					rs.Description = strings.TrimSpace(ss[pos:])
-				} else {
-					rs.Description = strings.TrimSpace(ss)
 				}
-				opts.Responses[respCode] = rs
+				opts.Responses[st[0]] = rs
 			} else if strings.HasPrefix(t, "@Param") {
 				para := swagger.Parameter{}
 				p := getparams(strings.TrimSpace(t[len("@Param "):]))
@@ -432,7 +446,7 @@ func parserComments(comments *ast.CommentGroup, funcName, controllerName, pkgpat
 				case "body":
 					break
 				default:
-					ColorLog("[WARN][%s.%s] Unknow param location: %s, Possible values are `query`, `header`, `path`, `formData` or `body`.\n", controllerName, funcName, p[1])
+					fmt.Fprintf(os.Stderr, "[%s.%s] Unknow param location: %s, Possible values are `query`, `header`, `path`, `formData` or `body`.\n", controllerName, funcName, p[1])
 				}
 				para.In = p[1]
 				pp := strings.Split(p[2], ".")
@@ -448,32 +462,15 @@ func parserComments(comments *ast.CommentGroup, funcName, controllerName, pkgpat
 					modelsList[pkgpath+controllerName][typ] = mod
 					appendModels(cmpath, pkgpath, controllerName, realTypes)
 				} else {
-					isArray := false
-					paraType := ""
-					paraFormat := ""
-					if strings.HasPrefix(typ, "[]") {
-						typ = typ[2:]
-						isArray = true
-					}
 					if typ == "string" || typ == "number" || typ == "integer" || typ == "boolean" ||
 						typ == "array" || typ == "file" {
-						paraType = typ
+						para.Type = typ
 					} else if sType, ok := basicTypes[typ]; ok {
 						typeFormat := strings.Split(sType, ":")
-						paraType = typeFormat[0]
-						paraFormat = typeFormat[1]
+						para.Type = typeFormat[0]
+						para.Format = typeFormat[1]
 					} else {
-						ColorLog("[WARN][%s.%s] Unknow param type: %s\n", controllerName, funcName, typ)
-					}
-					if isArray {
-						para.Type = "array"
-						para.Items = &swagger.ParameterItems{
-							Type:   paraType,
-							Format: paraFormat,
-						}
-					} else {
-						para.Type = paraType
-						para.Format = paraFormat
+						fmt.Fprintf(os.Stderr, "[%s.%s] Unknow param type: %s\n", controllerName, funcName, typ)
 					}
 				}
 				if len(p) > 4 {
@@ -612,114 +609,93 @@ func getModel(str string) (pkgpath, objectname string, m swagger.Schema, realTyp
 					if k != objectname {
 						continue
 					}
-					parseObject(d, k, &m, &realTypes, astPkgs)
-				}
-			}
-		}
-	}
-	if m.Title == "" {
-		ColorLog("[WARN]can't find the object: %s\n", str)
-		// TODO remove when all type have been supported
-		//os.Exit(1)
-	}
-	if len(rootapi.Definitions) == 0 {
-		rootapi.Definitions = make(map[string]swagger.Schema)
-	}
-	rootapi.Definitions[objectname] = m
-	return
-}
-
-func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string, astPkgs map[string]*ast.Package) {
-	ts, ok := d.Decl.(*ast.TypeSpec)
-	if !ok {
-		ColorLog("Unknown type without TypeSec: %v\n", d)
-		os.Exit(1)
-	}
-	// TODO support other types, such as `ArrayType`, `MapType`, `InterfaceType` etc...
-	st, ok := ts.Type.(*ast.StructType)
-	if !ok {
-		return
-	}
-	m.Title = k
-	if st.Fields.List != nil {
-		m.Properties = make(map[string]swagger.Propertie)
-		for _, field := range st.Fields.List {
-			isSlice, realType, sType := typeAnalyser(field)
-			*realTypes = append(*realTypes, realType)
-			mp := swagger.Propertie{}
-			if isSlice {
-				mp.Type = "array"
-				if isBasicType(realType) {
-					typeFormat := strings.Split(sType, ":")
-					mp.Items = &swagger.Propertie{
-						Type:   typeFormat[0],
-						Format: typeFormat[1],
+					ts, ok := d.Decl.(*ast.TypeSpec)
+					if !ok {
+						ColorLog("Unknown type without TypeSec: %v", d)
+						os.Exit(1)
 					}
-				} else {
-					mp.Items = &swagger.Propertie{
-						Ref: "#/definitions/" + realType,
+					st, ok := ts.Type.(*ast.StructType)
+					if !ok {
+						continue
 					}
-				}
-			} else {
-				if isBasicType(realType) {
-					typeFormat := strings.Split(sType, ":")
-					mp.Type = typeFormat[0]
-					mp.Format = typeFormat[1]
-				} else if sType == "object" {
-					mp.Ref = "#/definitions/" + realType
-				}
-			}
-			if field.Names != nil {
+					m.Title = k
+					if st.Fields.List != nil {
+						m.Properties = make(map[string]swagger.Propertie)
+						for _, field := range st.Fields.List {
+							isSlice, realType, sType := typeAnalyser(field)
+							realTypes = append(realTypes, realType)
+							mp := swagger.Propertie{}
+							// add type slice
+							if isSlice {
+								mp.Type = "array"
+								if isBasicType(realType) {
+									typeFormat := strings.Split(sType, ":")
+									mp.Items = &swagger.Propertie{
+										Type:   typeFormat[0],
+										Format: typeFormat[1],
+									}
 
-				// set property name as field name
-				var name = field.Names[0].Name
+								} else {
+									mp.Items = &swagger.Propertie{
+										Ref: "#/definitions/" + realType,
+									}
+								}
+							} else {
+								if isBasicType(realType) {
+									typeFormat := strings.Split(sType, ":")
+									mp.Type = typeFormat[0]
+									mp.Format = typeFormat[1]
+								} else if sType == "object" {
+									mp.Ref = "#/definitions/" + realType
+								}
+							}
 
-				// if no tag skip tag processing
-				if field.Tag == nil {
-					m.Properties[name] = mp
-					continue
-				}
+							// dont add property if anonymous field
+							if field.Names != nil {
 
-				var tagValues []string
-				stag := reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
-				tag := stag.Get("json")
+								// set property name as field name
+								var name = field.Names[0].Name
 
-				if tag != "" {
-					tagValues = strings.Split(tag, ",")
-				}
+								// if no tag skip tag processing
+								if field.Tag == nil {
+									m.Properties[name] = mp
+									continue
+								}
 
-				// dont add property if json tag first value is "-"
-				if len(tagValues) == 0 || tagValues[0] != "-" {
+								var tagValues []string
+								stag := reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
+								tag := stag.Get("json")
 
-					// set property name to the left most json tag value only if is not omitempty
-					if len(tagValues) > 0 && tagValues[0] != "omitempty" {
-						name = tagValues[0]
-					}
+								if tag != "" {
+									tagValues = strings.Split(tag, ",")
+								}
 
-					if thrifttag := stag.Get("thrift"); thrifttag != "" {
-						ts := strings.Split(thrifttag, ",")
-						if ts[0] != "" {
-							name = ts[0]
-						}
-					}
-					if required := stag.Get("required"); required != "" {
-						m.Required = append(m.Required, name)
-					}
-					if desc := stag.Get("description"); desc != "" {
-						mp.Description = desc
-					}
+								// dont add property if json tag first value is "-"
+								if len(tagValues) == 0 || tagValues[0] != "-" {
 
-					m.Properties[name] = mp
-				}
-				if ignore := stag.Get("ignore"); ignore != "" {
-					continue
-				}
-			} else {
-				for _, pkg := range astPkgs {
-					for _, fl := range pkg.Files {
-						for nameOfObj, obj := range fl.Scope.Objects {
-							if obj.Name == fmt.Sprint(field.Type) {
-								parseObject(obj, nameOfObj, m, realTypes, astPkgs)
+									// set property name to the left most json tag value only if is not omitempty
+									if len(tagValues) > 0 && tagValues[0] != "omitempty" {
+										name = tagValues[0]
+									}
+
+									if thrifttag := stag.Get("thrift"); thrifttag != "" {
+										ts := strings.Split(thrifttag, ",")
+										if ts[0] != "" {
+											name = ts[0]
+										}
+									}
+									if required := stag.Get("required"); required != "" {
+										m.Required = append(m.Required, name)
+									}
+									if desc := stag.Get("description"); desc != "" {
+										mp.Description = desc
+									}
+
+									m.Properties[name] = mp
+								}
+								if ignore := stag.Get("ignore"); ignore != "" {
+									continue
+								}
 							}
 						}
 					}
@@ -727,6 +703,15 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 			}
 		}
 	}
+	if m.Title == "" {
+		ColorLog("can't find the object: %s", str)
+		os.Exit(1)
+	}
+	if len(rootapi.Definitions) == 0 {
+		rootapi.Definitions = make(map[string]swagger.Schema)
+	}
+	rootapi.Definitions[objectname] = m
+	return
 }
 
 func typeAnalyser(f *ast.Field) (isSlice bool, realType, swaggerType string) {
