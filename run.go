@@ -87,7 +87,7 @@ func runApp(cmd *Command, args []string) int {
 			currentGoPath = _gopath
 			appname = path.Base(currpath)
 		} else {
-			panic(fmt.Sprintf("No Beego application '%s' found in your GOPATH", args[0]))
+			//panic(fmt.Sprintf("No Beego application '%s' found in your GOPATH", args[0]))
 		}
 
 		ColorLog("[INFO] Using '%s' as 'appname'\n", appname)
